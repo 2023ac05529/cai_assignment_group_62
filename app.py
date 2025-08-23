@@ -4,6 +4,7 @@ import torch
 import faiss
 import json
 import numpy as np
+import joblib # Added for loading sparse models
 from sentence_transformers import SentenceTransformer
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
 from peft import PeftModel
@@ -38,18 +39,25 @@ def load_all_models_and_data():
         except Exception as e:
             st.error(f"Could not load chunks. Make sure 'chunks_with_index.json' is in the same folder. Error: {e}")
             data['chunks_with_index'] = []
+            
+        # --- NEW: Load Sparse Models ---
+        try:
+            data['vectorizer'] = joblib.load('vectorizer.joblib')
+            data['sparse_retriever'] = joblib.load('sparse_retriever.joblib')
+        except Exception as e:
+            st.error(f"Could not load sparse models. Make sure 'vectorizer.joblib' and 'sparse_retriever.joblib' are present. Error: {e}")
+            data['vectorizer'], data['sparse_retriever'] = None, None
+
 
     # --- Load Fine-Tuned components ---
     with st.spinner("Loading Fine-Tuned model..."):
         model_name = 'google/flan-t5-base'
-        # IMPORTANT: Update this path if your checkpoint folder has a different name
-        lora_adapter_path = "./ril-qa-finetuned/checkpoint-95" 
+        lora_adapter_path = "./ril-qa-finetuned/checkpoint-20" 
         
         try:
             base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)
             ft_model = PeftModel.from_pretrained(base_model, lora_adapter_path)
             ft_tokenizer = AutoTokenizer.from_pretrained(model_name)
-            # No device arg needed here as device_map="auto" handles it
             models['ft_generator'] = pipeline('text2text-generation', model=ft_model, tokenizer=ft_tokenizer)
         except Exception as e:
             st.error(f"Could not load Fine-Tuned model from '{lora_adapter_path}'. Error: {e}")
@@ -66,25 +74,46 @@ def analyze_query_complexity(query):
     else:
         return "simple"
 
-def hybrid_adaptive_retrieval(query, data, models, top_k=1):
-    complexity = analyze_query_complexity(query)
+# --- CORRECTED: Full Hybrid Retrieval Logic ---
+def hybrid_adaptive_retrieval(query, data, models, top_k=5):
+    # 1. Dense Search (FAISS)
     query_embedding = models['embedding_model'].encode([query]).astype('float32')
-    _, indices = data['faiss_index'].search(query_embedding, top_k)
-    retrieved_chunk_index = indices[0][0]
+    _, dense_indices = data['faiss_index'].search(query_embedding, top_k)
+    dense_ids = [str(i) for i in dense_indices[0]]
 
+    # 2. Sparse Search (TF-IDF)
+    query_tfidf = data['vectorizer'].transform([query])
+    _, sparse_indices = data['sparse_retriever'].kneighbors(query_tfidf)
+    sparse_ids = [str(i) for i in sparse_indices[0]]
+
+    # 3. Reciprocal Rank Fusion (RRF)
+    rrf_scores = {}
+    k = 60
+    all_doc_ids = set(dense_ids + sparse_ids)
+    for doc_id in all_doc_ids:
+        score = 0
+        if doc_id in dense_ids:
+            score += 1 / (k + dense_ids.index(doc_id) + 1)
+        if doc_id in sparse_ids:
+            score += 1 / (k + sparse_ids.index(doc_id) + 1)
+        rrf_scores[doc_id] = score
+    
+    sorted_docs = sorted(rrf_scores.items(), key=lambda item: item[1], reverse=True)
+    top_doc_id = int(sorted_docs[0][0])
+
+    # 4. Adaptive Merging
+    complexity = analyze_query_complexity(query)
     if complexity == "simple":
-        return data['chunks_with_index'][retrieved_chunk_index]['text']
+        return data['chunks_with_index'][top_doc_id]['text']
     else:
-        start_index = max(0, retrieved_chunk_index - 1)
-        end_index = min(len(data['chunks_with_index']) - 1, retrieved_chunk_index + 1)
+        start_index = max(0, top_doc_id - 1)
+        end_index = min(len(data['chunks_with_index']) - 1, top_doc_id + 1)
         context_texts = [data['chunks_with_index'][i]['text'] for i in range(start_index, end_index + 1)]
         return "\\n---\\n".join(context_texts)
 
+
 def generate_rag_answer(query, models, data):
     start_time = time.time()
-    financial_keywords = {'revenue', 'profit', 'ebitda', 'jio', 'retail', 'subscriber', 'reliance', 'crore', 'billion', 'financial'}
-    if not any(kw in query.lower() for kw in financial_keywords):
-        return "Irrelevant question", 0.1, 0.1
     context_str = hybrid_adaptive_retrieval(query, data, models)
     prompt = f"Based on the following context, answer the question. If the answer is not in the context, state that. Context: {context_str}\\n\\nQuestion: {query}\\n\\nAnswer:"
     response = models['rag_generator'](prompt, max_length=256)
@@ -94,15 +123,9 @@ def generate_rag_answer(query, models, data):
 
 def generate_ft_answer(query, models):
     start_time = time.time()
-    financial_keywords = {'revenue', 'profit', 'ebitda', 'jio', 'retail', 'subscriber', 'reliance', 'crore', 'billion', 'financial'}
-    if not any(kw in query.lower() for kw in financial_keywords):
-        return "Irrelevant question", 0.1, 0.1
     prompt = f"question: {query} answer:"
     response = models['ft_generator'](prompt, max_length=256)
     answer = response[0]['generated_text']
-    refusal_phrases = ["i am a large language model", "i cannot answer", "i don't have information"]
-    if any(phrase in answer.lower() for phrase in refusal_phrases):
-        answer = "[Guardrail Triggered] The model was unable to provide a factual answer."
     end_time = time.time()
     return answer, 0.95, end_time - start_time
 
@@ -111,7 +134,6 @@ st.set_page_config(layout="wide")
 st.title("🤖 Financial QA Bot: RAG vs. Fine-Tuning")
 st.subheader("A comparison of two AI systems on Reliance Industries' Annual Reports")
 
-# Load models and data
 models, data = load_all_models_and_data()
 
 st.sidebar.header("System Selection")
@@ -121,7 +143,7 @@ query = st.text_input("Ask a financial question:", "What was the total retail st
 if st.button("Get Answer", type="primary"):
     if not query:
         st.warning("Please enter a question.")
-    elif method == "RAG (Adaptive Retrieval)" and (not data.get('faiss_index') or not data.get('chunks_with_index')):
+    elif method == "RAG (Adaptive Retrieval)" and not all([data.get('faiss_index'), data.get('chunks_with_index'), data.get('vectorizer')]):
         st.error("RAG components not loaded. Cannot proceed.")
     elif method == "Fine-Tuned (LoRA)" and not models.get('ft_generator'):
         st.error("Fine-Tuned model not loaded. Cannot proceed.")
