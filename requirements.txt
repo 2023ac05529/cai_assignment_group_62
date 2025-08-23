@@ -1,0 +1,10 @@
+streamlit
+torch
+faiss-cpu
+sentence-transformers
+transformers
+peft
+accelerate
+bitsandbytes
+scikit-learn
+PyMuPDF
