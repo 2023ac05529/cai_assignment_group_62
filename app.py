@@ -144,7 +144,7 @@ models, data = load_all_models_and_data()
 
 st.sidebar.header("System Selection")
 method = st.sidebar.radio("Choose a method:", ("RAG (Adaptive Retrieval)", "Fine-Tuned (LoRA)"))
-query = st.text_input("Ask a financial question:", "What was the total retail store count in FY 2023-24?")
+query = st.text_input("Ask a financial question:", "What was Reliance's Debenture Redemption reserve for the year ended March 31, 2025 in Standalone financial statement?")
 
 if st.button("Get Answer", type="primary"):
     if not query:
