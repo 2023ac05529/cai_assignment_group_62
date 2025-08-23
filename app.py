@@ -82,6 +82,9 @@ def hybrid_adaptive_retrieval(query, data, models, top_k=1):
 
 def generate_rag_answer(query, models, data):
     start_time = time.time()
+    financial_keywords = {'revenue', 'profit', 'ebitda', 'jio', 'retail', 'subscriber', 'reliance', 'crore', 'billion', 'financial'}
+    if not any(kw in query.lower() for kw in financial_keywords):
+        return "Irrelevant question", 0.1, 0.1
     context_str = hybrid_adaptive_retrieval(query, data, models)
     prompt = f"Based on the following context, answer the question. If the answer is not in the context, state that. Context: {context_str}\\n\\nQuestion: {query}\\n\\nAnswer:"
     response = models['rag_generator'](prompt, max_length=256)
@@ -91,9 +94,15 @@ def generate_rag_answer(query, models, data):
 
 def generate_ft_answer(query, models):
     start_time = time.time()
+    financial_keywords = {'revenue', 'profit', 'ebitda', 'jio', 'retail', 'subscriber', 'reliance', 'crore', 'billion', 'financial'}
+    if not any(kw in query.lower() for kw in financial_keywords):
+        return "Irrelevant question", 0.1, 0.1
     prompt = f"question: {query} answer:"
     response = models['ft_generator'](prompt, max_length=256)
     answer = response[0]['generated_text']
+    refusal_phrases = ["i am a large language model", "i cannot answer", "i don't have information"]
+    if any(phrase in answer.lower() for phrase in refusal_phrases):
+        answer = "[Guardrail Triggered] The model was unable to provide a factual answer."
     end_time = time.time()
     return answer, 0.95, end_time - start_time
 
@@ -106,7 +115,7 @@ st.subheader("A comparison of two AI systems on Reliance Industries' Annual Repo
 models, data = load_all_models_and_data()
 
 st.sidebar.header("System Selection")
-method = st.sidebar.selectbox("Choose a method:", ("RAG (Adaptive Retrieval)", "Fine-Tuned (LoRA)"))
+method = st.sidebar.radio("Choose a method:", ("RAG (Adaptive Retrieval)", "Fine-Tuned (LoRA)"))
 query = st.text_input("Ask a financial question:", "What was the total retail store count in FY 2023-24?")
 
 if st.button("Get Answer", type="primary"):
