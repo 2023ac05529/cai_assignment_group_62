@@ -114,6 +114,9 @@ def hybrid_adaptive_retrieval(query, data, models, top_k=5):
 
 def generate_rag_answer(query, models, data):
     start_time = time.time()
+    financial_keywords = {'revenue', 'profit', 'ebitda', 'jio', 'retail', 'subscriber', 'reliance', 'crore', 'billion', 'financial'}
+    if not any(kw in query.lower() for kw in financial_keywords):
+        return "Irrelevant question", 0.1, 0.1
     context_str = hybrid_adaptive_retrieval(query, data, models)
     prompt = f"Based on the following context, answer the question. If the answer is not in the context, state that. Context: {context_str}\\n\\nQuestion: {query}\\n\\nAnswer:"
     response = models['rag_generator'](prompt, max_length=256,num_return_sequences=1)
@@ -123,6 +126,9 @@ def generate_rag_answer(query, models, data):
 
 def generate_ft_answer(query, models):
     start_time = time.time()
+    financial_keywords = {'revenue', 'profit', 'ebitda', 'jio', 'retail', 'subscriber', 'reliance', 'crore', 'billion', 'financial'}
+    if not any(kw in query.lower() for kw in financial_keywords):
+        return "Irrelevant question", 0.1, 0.1
     prompt = f"question: {query} answer:"
     response = models['ft_generator'](prompt, max_length=256)
     answer = response[0]['generated_text']
