@@ -5,7 +5,7 @@ import faiss
 import json
 import numpy as np
 import joblib # Added for loading sparse models
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, util
 from transformers import AutoModelForSeq2SeqLM, AutoTokenizer, pipeline
 from peft import PeftModel
 
@@ -104,12 +104,14 @@ def hybrid_adaptive_retrieval(query, data, models, top_k=5):
     # 4. Adaptive Merging
     complexity = analyze_query_complexity(query)
     if complexity == "simple":
-        return data['chunks_with_index'][top_doc_id]['text']
-    else:
+        context = chunks_with_index[top_doc_id]['text']
+    else: # complex
         start_index = max(0, top_doc_id - 1)
-        end_index = min(len(data['chunks_with_index']) - 1, top_doc_id + 1)
-        context_texts = [data['chunks_with_index'][i]['text'] for i in range(start_index, end_index + 1)]
-        return "\\n---\\n".join(context_texts)
+        end_index = min(len(chunks_with_index) - 1, top_doc_id + 1)
+        context_texts = [chunks_with_index[i]['text'] for i in range(start_index, end_index + 1)]
+        context = "\n---\n".join(context_texts)
+    
+    return context, top_doc_id
 
 
 def generate_rag_answer(query, models, data):
@@ -117,12 +119,25 @@ def generate_rag_answer(query, models, data):
     financial_keywords = {'revenue', 'profit', 'ebitda', 'jio', 'retail', 'subscriber', 'reliance', 'crore', 'billion', 'financial'}
     if not any(kw in query.lower() for kw in financial_keywords):
         return "Irrelevant question", 0.1, 0.1
-    context_str = hybrid_adaptive_retrieval(query, data, models)
-    prompt = f"Based on the following context, answer the question. If the answer is not in the context, state that. Context: {context_str}\\n\\nQuestion: {query}\\n\\nAnswer:"
-    response = models['rag_generator'](prompt, max_length=256,num_return_sequences=1)
+    # Retrieve context and the index of the top document
+    context_str, top_doc_id = hybrid_adaptive_retrieval(query)
+    
+    # Calculate Confidence Score
+    query_embedding = embedding_model.encode(query, convert_to_tensor=True)
+    doc_embedding = torch.tensor(chunk_embeddings[top_doc_id]).to(device)
+    
+    # Compute cosine similarity
+    similarity = util.cos_sim(query_embedding, doc_embedding)[0][0].item()
+    # Normalize score to be between 0 and 1
+    confidence = (similarity + 1) / 2
+
+    # Generate Answer
+    prompt = f"Based on the following context, answer the question. If the answer is not in the context, state that. Context: {context_str}\n\nQuestion: {query}\n\nAnswer:"
+    response = rag_generator(prompt, max_length=256, num_return_sequences=1)
     answer = response[0]['generated_text']
     end_time = time.time()
-    return answer, 0.90, end_time - start_time
+    
+    return answer, confidence, end_time - start_time
 
 def generate_ft_answer(query, models):
     start_time = time.time()
@@ -130,10 +145,40 @@ def generate_ft_answer(query, models):
     if not any(kw in query.lower() for kw in financial_keywords):
         return "Irrelevant question", 0.1, 0.1
     prompt = f"question: {query} answer:"
-    response = models['ft_generator'](prompt, max_length=256)
-    answer = response[0]['generated_text']
+    # Tokenize the input prompt
+    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    # Generate the answer and get token scores
+    with torch.no_grad():
+        outputs = ft_model.generate(
+            **inputs,
+            max_length=256,
+            output_scores=True,
+            return_dict_in_generate=True
+        )
+    # Decode the generated answer
+    answer_ids = outputs.sequences[0][1:] # Exclude the start token
+    answer = tokenizer.decode(answer_ids, skip_special_tokens=True)
+    # Calculate Confidence Score from token probabilities
+    log_probs = []
+    for i, token_id in enumerate(answer_ids):
+        # Get the logits for the current step
+        logits = outputs.scores[i]
+        # Convert logits to log probabilities
+        log_softmax = torch.nn.functional.log_softmax(logits, dim=-1)
+        # Get the log probability of the chosen token
+        token_log_prob = log_softmax[0, token_id].item()
+        log_probs.append(token_log_prob)
+    # Calculate the average log probability and convert it to a confidence score
+    avg_log_prob = sum(log_probs) / len(log_probs)
+    confidence = np.exp(avg_log_prob)
     end_time = time.time()
-    return answer, 0.95, end_time - start_time
+    
+    # Output-Side Guardrail
+    refusal_phrases = ["i am a large language model", "i cannot answer", "i don't have information"]
+    if any(phrase in answer.lower() for phrase in refusal_phrases):
+        answer = "[Guardrail Triggered] The model was unable to provide a factual answer."
+
+    return answer, confidence, end_time - start_time
 
 # --- APP UI ---
 st.set_page_config(layout="wide")
