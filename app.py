@@ -21,6 +21,7 @@ def load_all_models_and_data():
     
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     st.sidebar.info(f"Running on: **{device.upper()}**")
+    models['device'] = device
 
     # --- Load RAG components ---
     with st.spinner("Loading RAG models and data..."):
@@ -36,11 +37,12 @@ def load_all_models_and_data():
         try:
             with open('chunks_with_index.json', 'r') as f:
                 data['chunks_with_index'] = json.load(f)
+                data['chunk_embeddings'] = models['embedding_model'].encode([chunk['text'] for chunk in data['chunks_with_index']])
         except Exception as e:
             st.error(f"Could not load chunks. Make sure 'chunks_with_index.json' is in the same folder. Error: {e}")
             data['chunks_with_index'] = []
             
-        # --- NEW: Load Sparse Models ---
+        # --- Load Sparse Models ---
         try:
             data['vectorizer'] = joblib.load('vectorizer.joblib')
             data['sparse_retriever'] = joblib.load('sparse_retriever.joblib')
@@ -56,12 +58,12 @@ def load_all_models_and_data():
         
         try:
             base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)
-            ft_model = PeftModel.from_pretrained(base_model, lora_adapter_path)
-            ft_tokenizer = AutoTokenizer.from_pretrained(model_name)
-            models['ft_generator'] = pipeline('text2text-generation', model=ft_model, tokenizer=ft_tokenizer)
+            models['ft_model'] = PeftModel.from_pretrained(base_model, lora_adapter_path)
+            models['ft_tokenizer'] = AutoTokenizer.from_pretrained(model_name)
         except Exception as e:
             st.error(f"Could not load Fine-Tuned model from '{lora_adapter_path}'. Error: {e}")
-            models['ft_generator'] = None
+            models['ft_model'] = None
+            models['ft_tokenizer'] = None
 
     return models, data
 
@@ -104,12 +106,12 @@ def hybrid_adaptive_retrieval(query, data, models, top_k=5):
     # 4. Adaptive Merging
     complexity = analyze_query_complexity(query)
     if complexity == "simple":
-        context = chunks_with_index[top_doc_id]['text']
+        context = data['chunks_with_index'][top_doc_id]['text']
     else: # complex
         start_index = max(0, top_doc_id - 1)
-        end_index = min(len(chunks_with_index) - 1, top_doc_id + 1)
-        context_texts = [chunks_with_index[i]['text'] for i in range(start_index, end_index + 1)]
-        context = "\n---\n".join(context_texts)
+        end_index = min(len(data['chunks_with_index']) - 1, top_doc_id + 1)
+        context_texts = [data['chunks_with_index'][i]['text'] for i in range(start_index, end_index + 1)]
+        context = "\\n---\\n".join(context_texts)
     
     return context, top_doc_id
 
@@ -120,11 +122,11 @@ def generate_rag_answer(query, models, data):
     if not any(kw in query.lower() for kw in financial_keywords):
         return "Irrelevant question", 0.1, 0.1
     # Retrieve context and the index of the top document
-    context_str, top_doc_id = hybrid_adaptive_retrieval(query, models, data)
+    context_str, top_doc_id = hybrid_adaptive_retrieval(query, data, models)
     
     # Calculate Confidence Score
-    query_embedding = embedding_model.encode(query, convert_to_tensor=True)
-    doc_embedding = torch.tensor(chunk_embeddings[top_doc_id]).to(device)
+    query_embedding = models['embedding_model'].encode(query, convert_to_tensor=True)
+    doc_embedding = torch.tensor(data['chunk_embeddings'][top_doc_id]).to(models['device'])
     
     # Compute cosine similarity
     similarity = util.cos_sim(query_embedding, doc_embedding)[0][0].item()
@@ -133,7 +135,7 @@ def generate_rag_answer(query, models, data):
 
     # Generate Answer
     prompt = f"Based on the following context, answer the question. If the answer is not in the context, state that. Context: {context_str}\n\nQuestion: {query}\n\nAnswer:"
-    response = rag_generator(prompt, max_length=256, num_return_sequences=1)
+    response = models['rag_generator'](prompt, max_length=256, num_return_sequences=1)
     answer = response[0]['generated_text']
     end_time = time.time()
     
@@ -146,18 +148,15 @@ def generate_ft_answer(query, models):
         return "Irrelevant question", 0.1, 0.1
     prompt = f"question: {query} answer:"
     # Tokenize the input prompt
-    inputs = tokenizer(prompt, return_tensors="pt").to(device)
+    inputs = models['ft_tokenizer'](prompt, return_tensors="pt").to(models['device'])
     # Generate the answer and get token scores
     with torch.no_grad():
-        outputs = ft_model.generate(
-            **inputs,
-            max_length=256,
-            output_scores=True,
-            return_dict_in_generate=True
-        )
+    outputs = models['ft_model'].generate(
+        **inputs, max_length=256, output_scores=True, return_dict_in_generate=True
+    )
     # Decode the generated answer
     answer_ids = outputs.sequences[0][1:] # Exclude the start token
-    answer = tokenizer.decode(answer_ids, skip_special_tokens=True)
+    answer = models['ft_tokenizer'].decode(answer_ids, skip_special_tokens=True)
     # Calculate Confidence Score from token probabilities
     log_probs = []
     for i, token_id in enumerate(answer_ids):
@@ -169,7 +168,7 @@ def generate_ft_answer(query, models):
         token_log_prob = log_softmax[0, token_id].item()
         log_probs.append(token_log_prob)
     # Calculate the average log probability and convert it to a confidence score
-    avg_log_prob = sum(log_probs) / len(log_probs)
+    avg_log_prob = sum(log_probs) / len(log_probs) if log_probs else 0
     confidence = np.exp(avg_log_prob)
     end_time = time.time()
     
@@ -196,7 +195,7 @@ if st.button("Get Answer", type="primary"):
         st.warning("Please enter a question.")
     elif method == "RAG (Adaptive Retrieval)" and not all([data.get('faiss_index'), data.get('chunks_with_index'), data.get('vectorizer')]):
         st.error("RAG components not loaded. Cannot proceed.")
-    elif method == "Fine-Tuned (LoRA)" and not models.get('ft_generator'):
+    elif method == "Fine-Tuned (LoRA)" and not models.get('ft_model'):
         st.error("Fine-Tuned model not loaded. Cannot proceed.")
     else:
         if method == "RAG (Adaptive Retrieval)":
@@ -212,5 +211,5 @@ if st.button("Get Answer", type="primary"):
         
         col1, col2, col3 = st.columns(3)
         col1.metric("Method Used", method.split(" ")[0])
-        col2.metric("Confidence (Placeholder)", f"{confidence:.2f}")
+        col2.metric("Confidence Score", f"{confidence:.2f}")
         col3.metric("Response Time (s)", f"{response_time:.2f}")
