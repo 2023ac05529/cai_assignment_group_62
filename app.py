@@ -120,7 +120,7 @@ def generate_rag_answer(query, models, data):
     if not any(kw in query.lower() for kw in financial_keywords):
         return "Irrelevant question", 0.1, 0.1
     # Retrieve context and the index of the top document
-    context_str, top_doc_id = hybrid_adaptive_retrieval(query)
+    context_str, top_doc_id = hybrid_adaptive_retrieval(query, models, data)
     
     # Calculate Confidence Score
     query_embedding = embedding_model.encode(query, convert_to_tensor=True)
