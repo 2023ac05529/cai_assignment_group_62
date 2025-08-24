@@ -52,7 +52,7 @@ def load_all_models_and_data():
     # --- Load Fine-Tuned components ---
     with st.spinner("Loading Fine-Tuned model..."):
         model_name = 'google/flan-t5-base'
-        lora_adapter_path = "./ril-qa-finetuned/checkpoint-95" 
+        lora_adapter_path = "./ril-qa-finetuned" 
         
         try:
             base_model = AutoModelForSeq2SeqLM.from_pretrained(model_name, device_map="auto", torch_dtype=torch.float16)
