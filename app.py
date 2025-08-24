@@ -151,9 +151,9 @@ def generate_ft_answer(query, models):
     inputs = models['ft_tokenizer'](prompt, return_tensors="pt").to(models['device'])
     # Generate the answer and get token scores
     with torch.no_grad():
-    outputs = models['ft_model'].generate(
-        **inputs, max_length=256, output_scores=True, return_dict_in_generate=True
-    )
+        outputs = models['ft_model'].generate(
+            **inputs, max_length=256, output_scores=True, return_dict_in_generate=True
+        )
     # Decode the generated answer
     answer_ids = outputs.sequences[0][1:] # Exclude the start token
     answer = models['ft_tokenizer'].decode(answer_ids, skip_special_tokens=True)
